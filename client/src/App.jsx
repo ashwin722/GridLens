@@ -53,6 +53,35 @@ const GridLensLogo = () => (
   </svg>
 );
 
+/**
+ * Custom Animated Spinner Component matching the GridLens Theme.
+ * Used as an overlay during large data fetches and Excel uploads.
+ */
+const ThemeSpinner = ({ text }) => (
+  <div style={{
+    position: 'absolute', top: 0, left: 0, width: '100%', height: '100%',
+    backgroundColor: 'rgba(17, 24, 39, 0.75)', backdropFilter: 'blur(4px)',
+    display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+    zIndex: 1000, borderRadius: '8px'
+  }}>
+    <div style={{ position: 'relative', width: '80px', height: '80px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      {/* Static Center Logo */}
+      <div style={{ position: 'absolute', transform: 'scale(1.2)' }}>
+        <GridLensLogo />
+      </div>
+      {/* Spinning Outer Ring */}
+      <svg viewBox="0 0 100 100" style={{ position: 'absolute', width: '100%', height: '100%', animation: 'spin 1.2s linear infinite' }}>
+        <circle cx="50" cy="50" r="46" fill="none" stroke="#374151" strokeWidth="4" />
+        <circle cx="50" cy="50" r="46" fill="none" stroke="#10B981" strokeWidth="4" strokeLinecap="round" strokeDasharray="80 200" />
+        <style>{`@keyframes spin { 100% { transform: rotate(360deg); } }`}</style>
+      </svg>
+    </div>
+    <h3 style={{ color: '#10B981', marginTop: '24px', fontFamily: 'inherit', fontWeight: '500', letterSpacing: '0.5px' }}>
+      {text}
+    </h3>
+  </div>
+);
+
 export default function App() {
   // --- STATE MANAGEMENT ---
   
@@ -64,8 +93,9 @@ export default function App() {
   const [userName, setUserName] = useState('');
   
   // UI & Loading State
-  const [loading, setLoading] = useState(false);
-  const [uploading, setUploading] = useState(false);
+  const [loading, setLoading] = useState(false);       // Login loading state
+  const [uploading, setUploading] = useState(false);   // File upload spinner state
+  const [isFetching, setIsFetching] = useState(false); // Initial grid data spinner state
   const [dropdownOpen, setDropdownOpen] = useState(false);
   
   // Notification (Toast) State
@@ -116,24 +146,27 @@ export default function App() {
     if (!forceRefresh && fetchedEmailRef.current === userEmail) return; 
     fetchedEmailRef.current = userEmail;
 
-    // 1. Fetch Role from Supabase 'user_roles' table
-    const { data: roleData, error: roleError } = await supabase
-      .from('user_roles')
-      .select('role, name')
-      .eq('email', userEmail)
-      .single();
+    // Trigger the Loading Spinner Overlay
+    setIsFetching(true);
 
-    if (roleData && !roleError) {
-      setUserRole(roleData.role);
-      // Fallback to the first part of the email if no name is provided in DB
-      setUserName(roleData.name || userEmail.split('@')[0]);
-    } else {
-      console.warn("No role found for this user.");
-    }
-
-    // 2. Fetch ALL Inventory Data from Backend API
-    // We use the Python API here instead of Supabase directly to bypass the default 1000-row Supabase API limit
     try {
+      // 1. Fetch Role from Supabase 'user_roles' table
+      const { data: roleData, error: roleError } = await supabase
+        .from('user_roles')
+        .select('role, name')
+        .eq('email', userEmail)
+        .single();
+
+      if (roleData && !roleError) {
+        setUserRole(roleData.role);
+        // Fallback to the first part of the email if no name is provided in DB
+        setUserName(roleData.name || userEmail.split('@')[0]);
+      } else {
+        console.warn("No role found for this user.");
+      }
+
+      // 2. Fetch ALL Inventory Data from Backend API
+      // We use the Python API here instead of Supabase directly to bypass the default 1000-row limit
       const response = await fetch(`${API_BASE_URL}/inventory`);
       if (response.ok) {
         const inventoryData = await response.json();
@@ -143,6 +176,9 @@ export default function App() {
       }
     } catch (error) {
       showNotification("Could not connect to Backend server for data.", "error");
+    } finally {
+      // Safely remove the spinner whether the fetch succeeded or failed
+      setIsFetching(false);
     }
   };
 
@@ -171,6 +207,7 @@ export default function App() {
     const file = e.target.files[0];
     if (!file) return;
 
+    // Trigger the Upload Spinner Overlay
     setUploading(true);
     
     // Prepare file for multipart/form-data transmission
@@ -195,6 +232,7 @@ export default function App() {
       showNotification('Error connecting to the Python server. Is it running?', 'error');
     }
     
+    // Stop the upload spinner and reset the file input
     setUploading(false);
     e.target.value = null; // Clear the file input so the user can upload the same file again if needed
   };
@@ -350,8 +388,14 @@ export default function App() {
             </div>
           </div>
 
-          {/* MAIN DATA GRID (AG-Grid) */}
-          <div className="grid-container ag-theme-alpine">
+          {/* MAIN DATA GRID (AG-Grid) 
+              Position relative added to contain the absolute positioned spinner overlay */}
+          <div className="grid-container ag-theme-alpine" style={{ position: 'relative' }}>
+            
+            {/* Conditional Loading Overlays */}
+            {isFetching && <ThemeSpinner text="Loading Inventory Data..." />}
+            {uploading && <ThemeSpinner text="Processing Database Upload..." />}
+
             <AgGridReact
               theme="legacy"
               rowData={rowData}
