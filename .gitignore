@@ -1,0 +1,32 @@
+# --- SECRETS & ENVIRONMENT ---
+.env
+.env.local
+.env.*.local
+
+# --- PYTHON (Backend) ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+build/
+dist/
+.python-version
+
+# --- NODE / REACT (Frontend) ---
+node_modules/
+dist/
+dist-ssr
+*.local
+.DS_Store
+
+# --- IDE & SYSTEM ---
+.vscode/
+.idea/
+.project
+.pydevproject
+.settings/
+*.swp
+*.log
