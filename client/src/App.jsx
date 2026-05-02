@@ -314,10 +314,18 @@ export default function App() {
         ------------------------- */
         <div className="login-wrapper">
           <form className="login-form" onSubmit={handleLogin}>
+            
+            {/* NEW: Stacked Brand Header specifically for Login */}
             <div className="login-header">
-              <GridLensLogo />
-              <h2>GridLens</h2>
+              <h2 className="login-brand-title">
+                <span className="brand-octo">OCTO</span><span className="brand-proc">PROC</span>
+              </h2>
+              <div className="login-logo-text">
+                <GridLensLogo />
+                <h3 className="login-brand-subtitle">GridLens</h3>
+              </div>
             </div>
+
             <input className="input-field" type="email" placeholder="Email address" value={email} onChange={(e) => setEmail(e.target.value)} required />
             <input className="input-field" type="password" placeholder="Password" value={password} onChange={(e) => setPassword(e.target.value)} required />
             <button className="btn-primary" type="submit" disabled={loading}>
