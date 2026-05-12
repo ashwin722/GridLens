@@ -8,7 +8,10 @@ syncing them to the cloud database.
 
 import os
 import io
+import json
 import math
+import re
+from pathlib import Path
 import numpy as np
 import pandas as pd
 
@@ -23,6 +26,7 @@ load_dotenv()
 
 # Initialize FastAPI application
 app = FastAPI(title="GridLens API", version="1.0.0")
+API_VERSION = "1.1.0"
 
 # --- CORS CONFIGURATION ---
 # Allows the React frontend to communicate with this Python backend.
@@ -43,6 +47,12 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise ValueError("Missing Supabase credentials in .env file.")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+DATASET_TABLES = {
+    "surplus": os.getenv("SURPLUS_TABLE", "inventory"),
+    "vendor": os.getenv("VENDOR_TABLE", "vendor"),
+}
+DATA_DIR = Path(__file__).resolve().parent / "data"
 
 
 # --- CONSTANTS ---
@@ -72,23 +82,162 @@ COLUMN_MAPPING = {
 }
 
 
-# --- API ENDPOINTS ---
+def normalize_column_name(column_name):
+    """Convert an Excel header into a safe database column name."""
+    mapped_name = COLUMN_MAPPING.get(str(column_name).strip())
+    if mapped_name:
+        return mapped_name
 
-@app.get("/inventory")
-async def get_inventory():
-    """
-    Fetches the complete inventory dataset from Supabase.
-    Overrides the default PostgREST 1,000 row limit to ensure the frontend 
-    receives all records (up to 10,000) for the AG-Grid display.
-    """
+    normalized = str(column_name).strip().lower()
+    normalized = re.sub(r"[^a-z0-9]+", "_", normalized)
+    normalized = re.sub(r"_+", "_", normalized).strip("_")
+    return normalized or "column"
+
+
+def normalize_dataframe_columns(df):
+    """Normalize headers while keeping every Excel column and avoiding duplicates."""
+    seen_columns = {}
+    normalized_columns = []
+
+    for column in df.columns:
+        base_column = normalize_column_name(column)
+        next_column = base_column
+        duplicate_index = 2
+
+        while next_column in seen_columns:
+            next_column = f"{base_column}_{duplicate_index}"
+            duplicate_index += 1
+
+        seen_columns[next_column] = True
+        normalized_columns.append(next_column)
+
+    df.columns = normalized_columns
+    return df
+
+
+def clean_cell_value(value):
+    """Convert Pandas/Numpy values into JSON-safe Python values."""
+    if value is None or value is pd.NA:
+        return None
+
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+
+    if isinstance(value, (np.integer,)):
+        return int(value)
+
+    if isinstance(value, (np.floating,)):
+        value = float(value)
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+
+    if isinstance(value, (pd.Timestamp,)):
+        return value.isoformat()
+
+    return value
+
+
+def dataframe_to_records(df):
+    """Convert a cleaned DataFrame into Supabase-ready records."""
+    df = df.replace({np.nan: None, np.inf: None, -np.inf: None, pd.NA: None})
+    records = df.to_dict(orient='records')
+
+    clean_records = []
+    for record in records:
+        clean_records.append({
+            key: clean_cell_value(value)
+            for key, value in record.items()
+        })
+
+    return clean_records
+
+
+def dataset_file_path(dataset):
+    return DATA_DIR / f"{dataset}.json"
+
+
+def save_dataset_file(dataset, records):
+    DATA_DIR.mkdir(exist_ok=True)
+    with dataset_file_path(dataset).open("w", encoding="utf-8") as file:
+        json.dump(records, file, ensure_ascii=False, allow_nan=False)
+
+
+def load_dataset_file(dataset):
+    path = dataset_file_path(dataset)
+    if not path.exists():
+        return None
+
+    with path.open("r", encoding="utf-8") as file:
+        return json.load(file)
+
+
+def fetch_supabase_table(table_name):
     try:
-        response = supabase.table('inventory') \
+        response = supabase.table(table_name) \
             .select("*") \
-            .order('id') \
             .limit(10000) \
             .execute()
-        
-        return response.data
+    except Exception as e:
+        error_message = str(e)
+        if "PGRST205" in error_message or "Could not find the table" in error_message:
+            print(f"Supabase table '{table_name}' not found. Returning empty dataset.")
+            return []
+        raise
+
+    return response.data
+
+
+def replace_table_data(table_name, records):
+    """
+    Delete existing rows and insert the uploaded records.
+    Supabase requires a filter for deletes, so we use a not-null filter on the
+    first available column from the incoming sheet.
+    """
+    if not records:
+        return
+
+    delete_column = "id" if "id" in records[0] else next(iter(records[0]))
+    supabase.table(table_name).delete().not_.is_(delete_column, "null").execute()
+
+    batch_size = 500
+    for start in range(0, len(records), batch_size):
+        supabase.table(table_name).insert(records[start:start + batch_size]).execute()
+
+
+# --- API ENDPOINTS ---
+
+def get_dataset_records(dataset):
+    table_name = DATASET_TABLES.get(dataset)
+    if not table_name:
+        raise HTTPException(status_code=404, detail="Dataset not found.")
+
+    saved_data = load_dataset_file(dataset)
+    if saved_data is not None:
+        return saved_data
+
+    return fetch_supabase_table(table_name)
+
+
+@app.get("/")
+async def health_check():
+    return {
+        "status": "ok",
+        "service": "GridLens API",
+        "version": API_VERSION,
+        "datasets": list(DATASET_TABLES.keys())
+    }
+
+
+@app.get("/inventory")
+@app.get("/surplus")
+@app.get("/datasets/surplus")
+async def get_inventory():
+    """Fetches the complete surplus inventory dataset."""
+    try:
+        return get_dataset_records("surplus")
     
     except Exception as e:
         print(f"Error fetching inventory: {str(e)}")
@@ -96,77 +245,77 @@ async def get_inventory():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/vendor")
+@app.get("/datasets/vendor")
+async def get_vendor_inventory():
+    """Fetches the complete vendor dataset."""
+    try:
+        return get_dataset_records("vendor")
+
+    except Exception as e:
+        print(f"Error fetching vendor inventory: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/datasets/{dataset}")
+async def get_dataset(dataset: str):
+    """Fetches any configured dataset by key."""
+    try:
+        return get_dataset_records(dataset)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error fetching {dataset} dataset: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/upload")
-async def upload_excel(file: UploadFile = File(...)):
+async def upload_excel(dataset: str = "surplus", file: UploadFile = File(...)):
     """
-    Accepts an Excel file upload, maps the columns to the database schema, 
-    aggressively cleans the data to ensure JSON/PostgreSQL compliance, 
-    and upserts the records into Supabase.
+    Accepts an Excel file upload, scans the headers, cleans the values,
+    deletes the selected dataset's previous rows, and inserts the new data.
     """
     # 1. Basic File Validation
     if not file.filename.endswith(('.xlsx', '.xls')):
         raise HTTPException(status_code=400, detail="File must be an Excel format (.xlsx or .xls)")
+
+    table_name = DATASET_TABLES.get(dataset)
+    if not table_name:
+        raise HTTPException(status_code=400, detail="Invalid dataset selected.")
     
     try:
         # 2. Read File into Memory
         # Using io.BytesIO prevents needing to save the file to the server's hard drive
         contents = await file.read()
         df = pd.read_excel(io.BytesIO(contents))
-        
-        # 3. Standardize Columns
-        # Rename columns based on our mapping and drop any extra columns that don't belong in the DB
-        df.rename(columns=COLUMN_MAPPING, inplace=True)
-        valid_columns = list(COLUMN_MAPPING.values())
-        df = df[[col for col in df.columns if col in valid_columns]]
-        
-        # --- DATA CLEANING PIPELINE ---
-        
-        # Drop rogue blank rows at the bottom of the Excel sheet
-        df = df.dropna(subset=['id'])
-        
-        # Enforce strict Integer types (e.g., ID, Year)
-        # Using Pandas 'Int64' (capital I) allows the column to hold integers AND nulls safely
-        int_columns = ['id', 'shelf_life_months', 'year_code']
-        for col in int_columns:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').round().astype('Int64')
 
-        # Enforce Float types for quantities and money to preserve decimals (e.g., 102.3)
-        decimal_columns = ['quantity', 'balance_unit', 'value']
-        for col in decimal_columns:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
+        # 3. Keep all headers from Excel, normalize them for database column names,
+        # and remove rows that are completely empty.
+        df = normalize_dataframe_columns(df)
+        df = df.dropna(how='all')
+        clean_records = dataframe_to_records(df)
 
-        # First pass at null conversion: Swap Pandas NaNs for Python Nones
-        df = df.replace({np.nan: None, np.inf: None, -np.inf: None, pd.NA: None})
-        
-        # Convert DataFrame to a list of dictionaries (one dict per row)
-        records = df.to_dict(orient='records')
+        # 4. Overwrite selected dataset locally so the app can support dynamic
+        # Excel headers even when the Supabase table schema has not been changed.
+        save_dataset_file(dataset, clean_records)
 
-        # --- THE JSON SAFETY NET ---
-        # df.to_dict() can sometimes leave microscopic float('nan') objects behind.
-        # Standard JSON cannot parse NaN or Infinity. This loop acts as a final filter 
-        # to guarantee every single value is 100% JSON compliant before sending to Supabase.
-        clean_records = []
-        for record in records:
-            clean_record = {}
-            for key, val in record.items():
-                if isinstance(val, float):
-                    if math.isnan(val) or math.isinf(val):
-                        clean_record[key] = None
-                    else:
-                        clean_record[key] = val
-                else:
-                    clean_record[key] = val
-            clean_records.append(clean_record)
-
-        # 4. Upsert Data to Database
-        # 'upsert' means it will UPDATE existing rows if the ID matches, or INSERT new rows if the ID is new.
-        response = supabase.table('inventory').upsert(clean_records).execute()
+        # 5. Also sync to Supabase when the selected table has matching columns.
+        # If Supabase rejects a new header/schema, the local dataset remains usable.
+        supabase_synced = True
+        supabase_warning = None
+        try:
+            replace_table_data(table_name, clean_records)
+        except Exception as sync_error:
+            supabase_synced = False
+            supabase_warning = str(sync_error)
+            print(f"Supabase sync skipped for {dataset}: {supabase_warning}")
         
         return {
             "message": "Upload successful!", 
-            "rows_processed": len(clean_records)
+            "rows_processed": len(clean_records),
+            "supabase_synced": supabase_synced,
+            "warning": supabase_warning
         }
         
     except Exception as e:

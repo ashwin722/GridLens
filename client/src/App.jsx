@@ -23,6 +23,46 @@ import 'ag-grid-community/styles/ag-theme-alpine.css';
 // or falls back to localhost for local development.
 const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
+const DATASET_CONFIG = {
+  surplus: {
+    label: 'Surplus',
+    endpoint: '/inventory',
+    loadingText: 'Loading Surplus Data...'
+  },
+  vendor: {
+    label: 'Vendor',
+    endpoint: '/vendor',
+    loadingText: 'Loading Vendor Data...'
+  }
+};
+
+const HEADER_LABELS = {
+  id: 'ID',
+  item_code: 'Item Code',
+  oem_no: 'OEM No.',
+  item_name: 'Item Name',
+  shelf_life_months: 'Shelf Life (M)',
+  year_code: 'Year Code',
+  balance_unit: 'Balance Qty'
+};
+
+const formatHeaderName = (field) => {
+  if (HEADER_LABELS[field]) return HEADER_LABELS[field];
+
+  return field
+    .split('_')
+    .filter(Boolean)
+    .map(word => {
+      if (word.length <= 3 && /^[a-z]+$/.test(word)) return word.toUpperCase();
+      return word.charAt(0).toUpperCase() + word.slice(1);
+    })
+    .join(' ');
+};
+
+const normalizeSearchField = (field) => (
+  field.toLowerCase().replace(/[^a-z0-9]/g, '')
+);
+
 // --- GLOBAL SIDE-EFFECTS ---
 // These run exactly once when the JavaScript bundle is loaded by the browser.
 // It dynamically injects the page title and custom SVG favicon.
@@ -97,17 +137,20 @@ export default function App() {
   const [uploading, setUploading] = useState(false);   // File upload spinner state
   const [isFetching, setIsFetching] = useState(false); // Initial grid data spinner state
   const [dropdownOpen, setDropdownOpen] = useState(false);
+  const [selectedDataset, setSelectedDataset] = useState(null);
   
   // Notification (Toast) State
   const [toast, setToast] = useState({ message: '', type: 'success', visible: false });
   
   // Data State
   const [rowData, setRowData] = useState([]);
+  const [searchTerm, setSearchTerm] = useState('');
   
   // --- REFS ---
   const toastTimerRef = useRef(null);       // Tracks the notification auto-hide timer
   const dropdownRef = useRef(null);         // Used to detect clicks outside the user menu
   const fetchedEmailRef = useRef(null);     // Prevents redundant API calls if data is already loaded for the current user
+  const fetchedDatasetRef = useRef(null);   // Prevents redundant dataset fetches while the user stays on the same sheet
 
   // --- HELPER FUNCTIONS ---
 
@@ -137,20 +180,15 @@ export default function App() {
   // --- API & DATA FETCHING ---
 
   /**
-   * Fetches the user's role from Supabase, and the full inventory dataset from the Python Backend.
+   * Fetches the user's role from Supabase after authentication.
    * @param {string} userEmail - The email of the currently logged-in user.
-   * @param {boolean} forceRefresh - If true, bypasses the fetchedEmailRef check to force a fresh data pull (used after uploads).
    */
-  const fetchRoleAndData = async (userEmail, forceRefresh = false) => {
+  const fetchUserProfile = async (userEmail) => {
     // Prevent duplicate fetches on initial load/re-renders
-    if (!forceRefresh && fetchedEmailRef.current === userEmail) return; 
+    if (fetchedEmailRef.current === userEmail) return; 
     fetchedEmailRef.current = userEmail;
 
-    // Trigger the Loading Spinner Overlay
-    setIsFetching(true);
-
     try {
-      // 1. Fetch Role from Supabase 'user_roles' table
       const { data: roleData, error: roleError } = await supabase
         .from('user_roles')
         .select('role, name')
@@ -164,15 +202,34 @@ export default function App() {
       } else {
         console.warn("No role found for this user.");
       }
+    } catch (error) {
+      showNotification("Could not fetch user profile.", "error");
+    }
+  };
 
-      // 2. Fetch ALL Inventory Data from Backend API
-      // We use the Python API here instead of Supabase directly to bypass the default 1000-row limit
-      const response = await fetch(`${API_BASE_URL}/inventory`);
+  /**
+   * Fetches the selected sheet data from the Python backend.
+   * @param {string} dataset - Either 'surplus' or 'vendor'.
+   * @param {boolean} forceRefresh - If true, force a fresh data pull.
+   */
+  const fetchDatasetData = async (dataset, forceRefresh = false) => {
+    const datasetConfig = DATASET_CONFIG[dataset];
+    if (!datasetConfig) return;
+
+    if (!forceRefresh && fetchedDatasetRef.current === dataset) return;
+    fetchedDatasetRef.current = dataset;
+
+    setIsFetching(true);
+    setRowData([]);
+    setSearchTerm('');
+
+    try {
+      const response = await fetch(`${API_BASE_URL}${datasetConfig.endpoint}`);
       if (response.ok) {
-        const inventoryData = await response.json();
-        setRowData(inventoryData);
+        const sheetData = await response.json();
+        setRowData(sheetData);
       } else {
-        showNotification("Failed to fetch inventory from server.", "error");
+        showNotification(`Failed to fetch ${datasetConfig.label} data from server.`, "error");
       }
     } catch (error) {
       showNotification("Could not connect to Backend server for data.", "error");
@@ -199,8 +256,24 @@ export default function App() {
     setUserRole(null);
     setUserName('');
     setRowData([]);
+    setSearchTerm('');
+    setSelectedDataset(null);
     setDropdownOpen(false);
     fetchedEmailRef.current = null;
+    fetchedDatasetRef.current = null;
+  };
+
+  const handleDatasetSelect = (dataset) => {
+    setSelectedDataset(dataset);
+    fetchDatasetData(dataset);
+  };
+
+  const handleDatasetBack = () => {
+    setSelectedDataset(null);
+    setRowData([]);
+    setSearchTerm('');
+    setDropdownOpen(false);
+    fetchedDatasetRef.current = null;
   };
 
   const handleFileUpload = async (e) => {
@@ -215,16 +288,21 @@ export default function App() {
     formData.append('file', file);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/upload`, {
+      const response = await fetch(`${API_BASE_URL}/upload?dataset=${selectedDataset || 'surplus'}`, {
         method: 'POST',
         body: formData,
       });
       const result = await response.json();
       
       if (response.ok) {
-        showNotification(`Success! Updated ${result.rows_processed} rows.`, 'success');
+        showNotification(
+          result.supabase_synced === false
+            ? `Success! Updated ${result.rows_processed} rows. Supabase table schema did not match every header, so GridLens is using the uploaded sheet data.`
+            : `Success! Updated ${result.rows_processed} rows.`,
+          'success'
+        );
         // Force a data refresh to show the newly uploaded data in the grid immediately
-        fetchRoleAndData(session.user.email, true);
+        fetchDatasetData(selectedDataset || 'surplus', true);
       } else {
         showNotification(`Upload failed: ${result.detail}`, 'error');
       }
@@ -252,7 +330,7 @@ export default function App() {
     // This fires automatically when a user logs in, logs out, or when the page refreshes and finds an active session
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
-      if (session) fetchRoleAndData(session.user.email);
+      if (session) fetchUserProfile(session.user.email);
     });
 
     // 3. Cleanup function
@@ -266,29 +344,54 @@ export default function App() {
 
   // --- AG-GRID CONFIGURATION ---
   
-  // OPTIMIZATION: useMemo prevents AG-Grid from re-rendering the columns unnecessarily
-  // If this wasn't memoized, the grid would reconstruct the DOM columns on every state change.
-  const columnDefs = useMemo(() => [
-    { field: 'id', headerName: 'ID', width: 80, pinned: 'left' },
-    { field: 'item_code', headerName: 'Item Code', width: 150 },
-    { field: 'name', headerName: 'Name', width: 150 },
-    { field: 'oem_no', headerName: 'OEM No.', width: 150 },
-    { field: 'item_name', headerName: 'Item Name', width: 250 },
-    { field: 'description', headerName: 'Description', width: 300 },
-    { field: 'category', headerName: 'Category', width: 150 },
-    { field: 'subcategory', headerName: 'Subcategory', width: 150 },
-    { field: 'make', headerName: 'Make', width: 150 },
-    { field: 'segment', headerName: 'Segment', width: 120 },
-    { field: 'shelf_life_months', headerName: 'Shelf Life (M)', width: 150 },
-    { field: 'year_code', headerName: 'Year Code', width: 120 },
-    { field: 'unit', headerName: 'Unit', width: 90 },
-    { field: 'quantity', headerName: 'Qty', width: 100 },
-    { field: 'balance_unit', headerName: 'Balance Qty', width: 150 },
-    { field: 'value', headerName: 'Value', width: 120 },
-    { field: 'status', headerName: 'Status', width: 130 },
-    { field: 'location', headerName: 'Location', width: 130 },
-    { field: 'remarks', headerName: 'Remarks', width: 250 }
-  ], []);
+  // OPTIMIZATION: Build AG-Grid headers from the returned data so each dataset
+  // can follow the columns from its uploaded Excel sheet.
+  const columnDefs = useMemo(() => {
+    const orderedFields = [];
+    const seenFields = new Set();
+
+    rowData.forEach(row => {
+      Object.keys(row || {}).forEach(field => {
+        if (!seenFields.has(field)) {
+          seenFields.add(field);
+          orderedFields.push(field);
+        }
+      });
+    });
+
+    return orderedFields.map(field => ({
+      field,
+      headerName: formatHeaderName(field),
+      width: field === 'id' ? 80 : 160,
+      pinned: field === 'id' ? 'left' : undefined
+    }));
+  }, [rowData]);
+
+  const filteredRowData = useMemo(() => {
+    const query = searchTerm.trim().toLowerCase();
+    if (!query) return rowData;
+
+    const categoryFields = columnDefs
+      .map(column => column.field)
+      .filter(field => {
+        const normalizedField = normalizeSearchField(field);
+        const normalizedHeader = normalizeSearchField(formatHeaderName(field));
+        return (
+          normalizedField === 'category' ||
+          normalizedField === 'subcategory' ||
+          normalizedHeader === 'category' ||
+          normalizedHeader === 'subcategory'
+        );
+      });
+
+    if (categoryFields.length === 0) return [];
+
+    return rowData.filter(row => (
+      categoryFields.some(field => (
+        String(row?.[field] ?? '').toLowerCase().includes(query)
+      ))
+    ));
+  }, [rowData, searchTerm, columnDefs]);
 
   // OPTIMIZATION: Only recalculate defaultColDef if the userRole changes
   // This ensures editability is updated immediately if role changes, but stays stable otherwise.
@@ -298,6 +401,8 @@ export default function App() {
     resizable: true, 
     editable: userRole === 'GRID_EDIT' // Only users with 'GRID_EDIT' privilege can edit cells
   }), [userRole]);
+
+  const activeDataset = selectedDataset ? DATASET_CONFIG[selectedDataset] : null;
 
   // --- RENDER ---
   return (
@@ -326,6 +431,39 @@ export default function App() {
           </form>
         </div>
         
+      ) : !selectedDataset ? (
+        
+        /* -------------------------
+           VIEW: DATASET SELECTION
+        ------------------------- */
+        <div className="choice-wrapper">
+          <div className="choice-panel">
+            <div className="choice-header">
+              <GridLensLogo />
+              <div>
+                <h2>Select Workspace</h2>
+                <p>Choose which data sheet you want to open.</p>
+              </div>
+            </div>
+
+            <div className="choice-actions">
+              <button className="choice-button" type="button" onClick={() => handleDatasetSelect('vendor')}>
+                <span className="choice-title">Vendor</span>
+                <span className="choice-meta">Open vendor inventory data</span>
+              </button>
+
+              <button className="choice-button" type="button" onClick={() => handleDatasetSelect('surplus')}>
+                <span className="choice-title">Surplus</span>
+                <span className="choice-meta">Open current surplus inventory data</span>
+              </button>
+            </div>
+
+            <button className="choice-signout" type="button" onClick={handleLogout}>
+              Sign out
+            </button>
+          </div>
+        </div>
+
       ) : (
         
         /* -------------------------
@@ -342,11 +480,26 @@ export default function App() {
               <h2 className="brand-title">
                 <span className="brand-octo">OCTO</span><span className="brand-proc">PROC</span>
                 <span className="brand-lens">GridLens</span>
+                <span className="dataset-badge">{activeDataset.label}</span>
               </h2>
             </div>
 
             {/* Actions & User Profile */}
             <div className="actions-section">
+              <button className="switch-button" type="button" onClick={handleDatasetBack}>
+                Switch
+              </button>
+
+              <div className="search-wrapper">
+                <input
+                  className="search-input"
+                  type="search"
+                  placeholder="Search category or subcategory..."
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  aria-label="Search inventory by category or subcategory"
+                />
+              </div>
               
               {/* Only show upload button to users with the specific Edit privilege */}
               {userRole === 'GRID_EDIT' && (
@@ -393,12 +546,12 @@ export default function App() {
           <div className="grid-container ag-theme-alpine" style={{ position: 'relative' }}>
             
             {/* Conditional Loading Overlays */}
-            {isFetching && <ThemeSpinner text="Loading Inventory Data..." />}
+            {isFetching && <ThemeSpinner text={activeDataset.loadingText} />}
             {uploading && <ThemeSpinner text="Processing Database Upload..." />}
 
             <AgGridReact
               theme="legacy"
-              rowData={rowData}
+              rowData={filteredRowData}
               columnDefs={columnDefs}
               defaultColDef={defaultColDef}
             />
