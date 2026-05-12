@@ -54,6 +54,11 @@ DATASET_TABLES = {
 }
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
+DATASET_ROUTES = {
+    "surplus": ["/inventory", "/surplus", "/datasets/surplus", "/api/inventory", "/api/surplus", "/api/datasets/surplus"],
+    "vendor": ["/vendor", "/vendors", "/datasets/vendor", "/api/vendor", "/api/vendors", "/api/datasets/vendor"],
+}
+
 
 # --- CONSTANTS ---
 # OPTIMIZATION: Moving this mapping outside the function means Python only creates it once 
@@ -222,18 +227,24 @@ def get_dataset_records(dataset):
 
 
 @app.get("/")
+@app.get("/health")
+@app.get("/api/health")
 async def health_check():
     return {
         "status": "ok",
         "service": "GridLens API",
         "version": API_VERSION,
-        "datasets": list(DATASET_TABLES.keys())
+        "datasets": list(DATASET_TABLES.keys()),
+        "dataset_routes": DATASET_ROUTES,
     }
 
 
 @app.get("/inventory")
 @app.get("/surplus")
 @app.get("/datasets/surplus")
+@app.get("/api/inventory")
+@app.get("/api/surplus")
+@app.get("/api/datasets/surplus")
 async def get_inventory():
     """Fetches the complete surplus inventory dataset."""
     try:
@@ -246,7 +257,11 @@ async def get_inventory():
 
 
 @app.get("/vendor")
+@app.get("/vendors")
 @app.get("/datasets/vendor")
+@app.get("/api/vendor")
+@app.get("/api/vendors")
+@app.get("/api/datasets/vendor")
 async def get_vendor_inventory():
     """Fetches the complete vendor dataset."""
     try:
@@ -271,6 +286,7 @@ async def get_dataset(dataset: str):
 
 
 @app.post("/upload")
+@app.post("/api/upload")
 async def upload_excel(dataset: str = "surplus", file: UploadFile = File(...)):
     """
     Accepts an Excel file upload, scans the headers, cleans the values,
