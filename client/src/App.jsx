@@ -202,7 +202,7 @@ export default function App() {
       } else {
         console.warn("No role found for this user.");
       }
-    } catch (error) {
+    } catch {
       showNotification("Could not fetch user profile.", "error");
     }
   };
@@ -231,7 +231,7 @@ export default function App() {
       } else {
         showNotification(`Failed to fetch ${datasetConfig.label} data from server.`, "error");
       }
-    } catch (error) {
+    } catch {
       showNotification("Could not connect to Backend server for data.", "error");
     } finally {
       // Safely remove the spinner whether the fetch succeeded or failed
@@ -290,6 +290,9 @@ export default function App() {
     try {
       const response = await fetch(`${API_BASE_URL}/upload?dataset=${selectedDataset || 'surplus'}`, {
         method: 'POST',
+        headers: {
+          Authorization: `Bearer ${session.access_token}`,
+        },
         body: formData,
       });
       const result = await response.json();
@@ -306,13 +309,46 @@ export default function App() {
       } else {
         showNotification(`Upload failed: ${result.detail}`, 'error');
       }
-    } catch (error) {
+    } catch {
       showNotification('Error connecting to the Python server. Is it running?', 'error');
     }
     
     // Stop the upload spinner and reset the file input
     setUploading(false);
     e.target.value = null; // Clear the file input so the user can upload the same file again if needed
+  };
+
+  const handleDatasetRemove = async () => {
+    if (!selectedDataset) return;
+
+    const datasetLabel = DATASET_CONFIG[selectedDataset].label;
+    const confirmed = window.confirm(`Remove all ${datasetLabel} data? This cannot be undone.`);
+    if (!confirmed) return;
+
+    setUploading(true);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/datasets/${selectedDataset}`, {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${session.access_token}`,
+        },
+      });
+      const result = await response.json();
+
+      if (response.ok) {
+        setRowData([]);
+        setSearchTerm('');
+        fetchedDatasetRef.current = selectedDataset;
+        showNotification(`${datasetLabel} data removed.`, 'success');
+      } else {
+        showNotification(`Remove failed: ${result.detail}`, 'error');
+      }
+    } catch {
+      showNotification('Error connecting to the Python server. Is it running?', 'error');
+    } finally {
+      setUploading(false);
+    }
   };
 
   // --- LIFECYCLE EFFECTS ---
@@ -403,6 +439,7 @@ export default function App() {
   }), [userRole]);
 
   const activeDataset = selectedDataset ? DATASET_CONFIG[selectedDataset] : null;
+  const canEdit = userRole === 'GRID_EDIT';
 
   // --- RENDER ---
   return (
@@ -498,6 +535,12 @@ export default function App() {
                 Switch
               </button>
 
+              {canEdit && (
+                <button className="remove-button" type="button" onClick={handleDatasetRemove} disabled={uploading || isFetching}>
+                  Remove
+                </button>
+              )}
+
               <div className="search-wrapper">
                 <input
                   className="search-input"
@@ -510,7 +553,7 @@ export default function App() {
               </div>
               
               {/* Only show upload button to users with the specific Edit privilege */}
-              {userRole === 'GRID_EDIT' && (
+              {canEdit && (
                 <div>
                   <input type="file" accept=".xlsx, .xls" onChange={handleFileUpload} id="excel-upload" style={{ display: 'none' }} />
                   <label htmlFor="excel-upload" className={`upload-label ${uploading ? 'disabled' : ''}`}>

@@ -307,6 +307,31 @@ body {
   background: #F9FAFB;
 }
 
+.remove-button {
+  height: 38px;
+  padding: 0 0.85rem;
+  border: 1px solid #FCA5A5;
+  border-radius: 6px;
+  background: #FFFFFF;
+  color: #B91C1C;
+  font-family: inherit;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s, color 0.2s;
+}
+
+.remove-button:hover:not(:disabled) {
+  border-color: #DC2626;
+  background: #FEF2F2;
+  color: #991B1B;
+}
+
+.remove-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .search-wrapper {
   min-width: 260px;
 }

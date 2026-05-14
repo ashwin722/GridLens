@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 
@@ -26,7 +26,7 @@ load_dotenv()
 
 # Initialize FastAPI application
 app = FastAPI(title="GridLens API", version="1.0.0")
-API_VERSION = "1.1.0"
+API_VERSION = "1.2.0"
 
 # --- CORS CONFIGURATION ---
 # Allows the React frontend to communicate with this Python backend.
@@ -52,6 +52,7 @@ DATASET_TABLES = {
     "surplus": os.getenv("SURPLUS_TABLE", "inventory"),
     "vendor": os.getenv("VENDOR_TABLE", "vendor"),
 }
+UPLOADS_TABLE = os.getenv("UPLOADS_TABLE", "gridlens_uploads")
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
 DATASET_ROUTES = {
@@ -179,6 +180,12 @@ def load_dataset_file(dataset):
         return json.load(file)
 
 
+def remove_dataset_file(dataset):
+    path = dataset_file_path(dataset)
+    if path.exists():
+        path.unlink()
+
+
 def fetch_supabase_table(table_name):
     try:
         response = supabase.table(table_name) \
@@ -193,6 +200,52 @@ def fetch_supabase_table(table_name):
         raise
 
     return response.data
+
+
+def fetch_uploaded_dataset(dataset):
+    try:
+        response = supabase.table(UPLOADS_TABLE) \
+            .select("records") \
+            .eq("dataset", dataset) \
+            .limit(1) \
+            .execute()
+    except Exception as e:
+        error_message = str(e)
+        if "PGRST205" in error_message or "Could not find the table" in error_message:
+            return None
+        raise
+
+    if not response.data:
+        return None
+
+    return response.data[0].get("records")
+
+
+def save_uploaded_dataset(dataset, records):
+    try:
+        supabase.table(UPLOADS_TABLE).upsert({
+            "dataset": dataset,
+            "records": records,
+        }, on_conflict="dataset").execute()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Could not permanently save uploaded {dataset} data. "
+                f"Create the '{UPLOADS_TABLE}' table from server/supabase_schema.sql, then upload again. "
+                f"Original error: {str(e)}"
+            ),
+        )
+
+
+def delete_uploaded_dataset(dataset):
+    try:
+        supabase.table(UPLOADS_TABLE).delete().eq("dataset", dataset).execute()
+    except Exception as e:
+        error_message = str(e)
+        if "PGRST205" in error_message or "Could not find the table" in error_message:
+            return
+        raise
 
 
 def replace_table_data(table_name, records):
@@ -212,12 +265,53 @@ def replace_table_data(table_name, records):
         supabase.table(table_name).insert(records[start:start + batch_size]).execute()
 
 
+def delete_table_data(table_name):
+    records = fetch_supabase_table(table_name)
+    if not records:
+        return
+
+    delete_column = "id" if "id" in records[0] else next(iter(records[0]))
+    supabase.table(table_name).delete().not_.is_(delete_column, "null").execute()
+
+
+async def require_edit_access(authorization: str | None = Header(default=None)):
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Login required.")
+
+    token = authorization.split(" ", 1)[1]
+
+    try:
+        user_response = supabase.auth.get_user(token)
+        user = user_response.user
+        if not user or not user.email:
+            raise HTTPException(status_code=401, detail="Invalid login session.")
+
+        role_response = supabase.table("user_roles") \
+            .select("role") \
+            .eq("email", user.email) \
+            .single() \
+            .execute()
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=403, detail="Could not verify edit access.")
+
+    if not role_response.data or role_response.data.get("role") != "GRID_EDIT":
+        raise HTTPException(status_code=403, detail="Edit access required.")
+
+    return user
+
+
 # --- API ENDPOINTS ---
 
 def get_dataset_records(dataset):
     table_name = DATASET_TABLES.get(dataset)
     if not table_name:
         raise HTTPException(status_code=404, detail="Dataset not found.")
+
+    uploaded_data = fetch_uploaded_dataset(dataset)
+    if uploaded_data is not None:
+        return uploaded_data
 
     saved_data = load_dataset_file(dataset)
     if saved_data is not None:
@@ -287,7 +381,11 @@ async def get_dataset(dataset: str):
 
 @app.post("/upload")
 @app.post("/api/upload")
-async def upload_excel(dataset: str = "surplus", file: UploadFile = File(...)):
+async def upload_excel(
+    dataset: str = "surplus",
+    file: UploadFile = File(...),
+    authorization: str | None = Header(default=None),
+):
     """
     Accepts an Excel file upload, scans the headers, cleans the values,
     deletes the selected dataset's previous rows, and inserts the new data.
@@ -295,6 +393,8 @@ async def upload_excel(dataset: str = "surplus", file: UploadFile = File(...)):
     # 1. Basic File Validation
     if not file.filename.endswith(('.xlsx', '.xls')):
         raise HTTPException(status_code=400, detail="File must be an Excel format (.xlsx or .xls)")
+
+    await require_edit_access(authorization)
 
     table_name = DATASET_TABLES.get(dataset)
     if not table_name:
@@ -312,12 +412,13 @@ async def upload_excel(dataset: str = "surplus", file: UploadFile = File(...)):
         df = df.dropna(how='all')
         clean_records = dataframe_to_records(df)
 
-        # 4. Overwrite selected dataset locally so the app can support dynamic
-        # Excel headers even when the Supabase table schema has not been changed.
-        save_dataset_file(dataset, clean_records)
+        # 4. Permanently save the exact uploaded sheet in Supabase JSONB storage.
+        # This avoids relying on the backend filesystem, which can be reset by hosts.
+        save_uploaded_dataset(dataset, clean_records)
+        remove_dataset_file(dataset)
 
-        # 5. Also sync to Supabase when the selected table has matching columns.
-        # If Supabase rejects a new header/schema, the local dataset remains usable.
+        # 5. Also sync to the legacy row table when it has matching columns.
+        # If that schema rejects new Excel headers, the JSONB upload remains durable.
         supabase_synced = True
         supabase_warning = None
         try:
@@ -334,6 +435,30 @@ async def upload_excel(dataset: str = "surplus", file: UploadFile = File(...)):
             "warning": supabase_warning
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error processing upload: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/datasets/{dataset}")
+@app.delete("/api/datasets/{dataset}")
+async def remove_dataset(dataset: str, authorization: str | None = Header(default=None)):
+    """Manually removes the selected dataset. This is the only explicit delete path."""
+    if dataset not in DATASET_TABLES:
+        raise HTTPException(status_code=400, detail="Invalid dataset selected.")
+
+    await require_edit_access(authorization)
+
+    table_name = DATASET_TABLES[dataset]
+
+    delete_uploaded_dataset(dataset)
+    remove_dataset_file(dataset)
+
+    try:
+        delete_table_data(table_name)
+    except Exception as e:
+        print(f"Legacy table cleanup skipped for {dataset}: {str(e)}")
+
+    return {"message": "Dataset removed.", "dataset": dataset}
